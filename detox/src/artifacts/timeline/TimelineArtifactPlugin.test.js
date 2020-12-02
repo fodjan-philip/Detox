@@ -1,5 +1,4 @@
 const _ = require('lodash');
-
 const latestInstanceOf = (clazz) => _.last(clazz.mock.instances);
 
 describe('TimelineArtifactPlugin', () => {
@@ -13,8 +12,8 @@ describe('TimelineArtifactPlugin', () => {
   });
 
   let fs;
-  let ChromeTracingParser;
-  let chromeTracingParserObj;
+  let ChromeTracingExporter;
+  let chromeTracingExporterObj;
   let FileArtifact;
   let fileArtifactObj;
   let Trace;
@@ -28,9 +27,9 @@ describe('TimelineArtifactPlugin', () => {
     }));
     fs = require('fs-extra');
 
-    jest.mock('../../utils/ChromeTracingParser');
-    ChromeTracingParser = require('../../utils/ChromeTracingParser');
-    chromeTracingParserObj = () => latestInstanceOf(ChromeTracingParser);
+    jest.mock('../../utils/ChromeTracingExporter');
+    ChromeTracingExporter = require('../../utils/ChromeTracingExporter');
+    chromeTracingExporterObj = () => latestInstanceOf(ChromeTracingExporter);
 
     jest.mock('../templates/artifact/FileArtifact');
     FileArtifact = require('../templates/artifact/FileArtifact');
@@ -169,25 +168,25 @@ describe('TimelineArtifactPlugin', () => {
       throw new Error('Make uutEnabled think the file doesnt already exist');
     });
     const givenArtifactFileAlreadyExists = () => fs.access.mockResolvedValue(undefined);
-    const givenParsedTraceDataResult = (result) => chromeTracingParserObj().parse.mockReturnValue(result);
+    const givenExportedTraceDataResult = (result) => chromeTracingExporterObj().export.mockReturnValue(result);
 
-    it('should create artifact with parsed trace data', async () => {
+    it('should create artifact with exported trace data', async () => {
       const uut = uutEnabled();
-      const parsedTraceData = JSON.stringify({ mocked: 'mocked data' });
+      const exportedData = JSON.stringify({ mocked: 'mocked data' });
       givenArtifactFileNotExists();
-      givenParsedTraceDataResult(parsedTraceData);
+      givenExportedTraceDataResult(exportedData);
 
       await uut.onBeforeCleanup();
 
-      expect(FileArtifact).toHaveBeenCalledWith({ temporaryData: parsedTraceData });
+      expect(FileArtifact).toHaveBeenCalledWith({ temporaryData: exportedData });
       expect(fileArtifactObj().save).toHaveBeenCalledWith(expectedArtifactPath, { append: false });
     });
 
-    it('should append parsed data if artifact file already exists', async () => {
+    it('should *append* exported data if artifact file already exists', async () => {
       const uut = uutEnabled();
-      const parsedTraceData = JSON.stringify({ mocked: 'mocked data' });
+      const exportedData = JSON.stringify({ mocked: 'mocked data' });
       givenArtifactFileAlreadyExists();
-      givenParsedTraceDataResult(parsedTraceData);
+      givenExportedTraceDataResult(exportedData);
 
       await uut.onBeforeCleanup();
 
@@ -196,32 +195,108 @@ describe('TimelineArtifactPlugin', () => {
 
     it('should not save artifact if disabled', async () => {
       const uut = uutDisabled();
-      const parsedTraceData = JSON.stringify({ mocked: 'mocked data' });
+      const exportedData = JSON.stringify({ mocked: 'mocked data' });
       givenArtifactFileNotExists();
-      givenParsedTraceDataResult(parsedTraceData);
+      givenExportedTraceDataResult(exportedData);
 
       await uut.onBeforeCleanup();
 
-      expect(chromeTracingParserObj().parse).not.toHaveBeenCalled();
+      expect(chromeTracingExporterObj().export).not.toHaveBeenCalled();
       expect(fileArtifactObj()).toBeUndefined();
       expect(fs.access).not.toHaveBeenCalled();
     });
 
-    it('should properly init the trace-events parser', async () => {
+    it('should properly init the trace-events exporter, and use the jest worker ID for thread-ID', async () => {
+      process.env.JEST_WORKER_ID = '102030';
+      const expectedThreadId = '102030';
+      const expectedThreadName = `Worker #102030`;
+      const uut = uutEnabled();
+
+      const exportedData = JSON.stringify({ mocked: 'mocked data' });
+      givenArtifactFileNotExists();
+      givenExportedTraceDataResult(exportedData);
+
+      await uut.onBeforeCleanup();
+
+      expect(ChromeTracingExporter).toHaveBeenCalledWith({
+        process: { id: 0, name: 'detox' },
+        thread: { id: expectedThreadId, name: expectedThreadName },
+      });
+    });
+
+    it('should resort to our pid as the exporter\'s thread-ID if not running using Jest', async () => {
+      process.env.JEST_WORKER_ID = '';
       const expectedThreadId = process.pid;
       const expectedThreadName = `Worker #${process.pid}`;
       const uut = uutEnabled();
 
-      const parsedTraceData = JSON.stringify({ mocked: 'mocked data' });
+      const exportedData = JSON.stringify({ mocked: 'mocked data' });
       givenArtifactFileNotExists();
-      givenParsedTraceDataResult(parsedTraceData);
+      givenExportedTraceDataResult(exportedData);
 
       await uut.onBeforeCleanup();
 
-      expect(ChromeTracingParser).toHaveBeenCalledWith({
-        process: { id: 0, name: 'detox' },
+      expect(ChromeTracingExporter).toHaveBeenCalledWith(expect.objectContaining({
         thread: { id: expectedThreadId, name: expectedThreadName },
-      })
+      }));
+    });
+
+    it('should use trace events as inpute to data exporter', async () => {
+      trace.events = [
+        { name: 'mock-event', type: 'start', ts: 1234},
+        { name: 'mock-event', type: 'end', ts: 1235},
+      ];
+      const uut = uutEnabled();
+
+      givenArtifactFileNotExists();
+      givenExportedTraceDataResult('mock');
+
+      await uut.onBeforeCleanup();
+
+      expect(chromeTracingExporterObj().export).toHaveBeenCalledWith(trace.events, false);
+    });
+
+    it('should pass in append=true to exporter if artifact file already exists', async () => {
+      trace.events = [];
+      const uut = uutEnabled();
+
+      givenArtifactFileAlreadyExists();
+      givenExportedTraceDataResult('mock');
+
+      await uut.onBeforeCleanup();
+
+      expect(chromeTracingExporterObj().export).toHaveBeenCalledWith([], true);
+    });
+
+    describe('In a stub-like operational mode', () => {
+      let uut;
+      beforeEach(() => {
+        uut = new TimelineArtifactPlugin({
+          ...configMock({ enabled: true }),
+          useFakeTimestamps: true,
+        });
+      });
+
+      it('should rewrite the timeline events with fake (deterministic) timestamps', async () => {
+        const events = [
+          { type: 'init', ts: 1233},
+          { name: 'mock-event', type: 'start', ts: 1234},
+          { name: 'mock-event', type: 'end', ts: 1235},
+        ];
+        const expectedEvents = [
+          { type: 'init', ts: 1000},
+          { name: 'mock-event', type: 'start', ts: 1100},
+          { name: 'mock-event', type: 'end', ts: 1200},
+        ];
+        trace.events = events;
+
+        givenArtifactFileNotExists();
+        givenExportedTraceDataResult('mock');
+
+        await uut.onBeforeCleanup();
+
+        expect(chromeTracingExporterObj().export).toHaveBeenCalledWith(expectedEvents, false);
+      });
     });
   });
 
